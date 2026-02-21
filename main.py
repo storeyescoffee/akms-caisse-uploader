@@ -183,21 +183,102 @@ def run_mount() -> None:
         pass
 
 
+def run_test_mode(log: logging.Logger, cfg: dict, day_offset: int) -> int:
+    """Test mode: check MQTT connectivity and dry-run the file detection process."""
+    log.info("🧪 Running in TEST mode (dry run)")
+    errors = 0
+
+    # --- MQTT connectivity check ---
+    log.info("--- MQTT connectivity check ---")
+    if not HAS_MQTT:
+        log.error("❌ paho-mqtt is not installed, MQTT unavailable")
+        errors += 1
+    else:
+        board_id = get_board_id()
+        topic = cfg["mqtt_topic"] or f"storeyes/{board_id}/caisse"
+        log.info("   Board ID : %s", board_id)
+        log.info("   Broker   : %s:%s", cfg["mqtt_host"], cfg["mqtt_port"])
+        log.info("   Topic    : %s", topic)
+        try:
+            client = mqtt.Client()
+            client.username_pw_set(cfg["mqtt_user"], cfg["mqtt_pass"])
+            client.connect(cfg["mqtt_host"], cfg["mqtt_port"], cfg["mqtt_timeout"])
+            client.disconnect()
+            log.info("✅ MQTT connection successful")
+        except Exception as e:
+            log.error("❌ MQTT connection failed: %s", e)
+            errors += 1
+
+    # --- Dry-run file detection ---
+    log.info("--- Dry-run file detection ---")
+    target_date, mmddyy, year_dir = target_date_and_paths(day_offset, cfg)
+    log.info("   Target date  : %s", target_date)
+    log.info("   MMDDYY       : %s", mmddyy)
+    log.info("   Year dir     : %s", year_dir)
+
+    if not year_dir.is_dir():
+        log.error("❌ Year directory not found: %s", year_dir)
+        errors += 1
+    else:
+        log.info("✅ Year directory exists")
+        db_pattern = f"VD{mmddyy}.DB"
+        mb_pattern = f"VD{mmddyy}.MB"
+        db_file = next(year_dir.glob(db_pattern), None)
+        mb_file = next(year_dir.glob(mb_pattern), None)
+
+        if db_file:
+            log.info("✅ DB file found: %s (%d bytes)", db_file.name, db_file.stat().st_size)
+        else:
+            log.warning("⚠️  DB file not found: %s", db_pattern)
+
+        if mb_file:
+            log.info("✅ MB file found: %s (%d bytes)", mb_file.name, mb_file.stat().st_size)
+        else:
+            log.warning("⚠️  MB file not found: %s", mb_pattern)
+
+        if db_file and mb_file:
+            if is_stable(db_file, cfg) and is_stable(mb_file, cfg):
+                log.info("✅ Both files are stable")
+            else:
+                log.warning("⚠️  Files exist but are still changing")
+
+    # --- API endpoint check ---
+    log.info("--- API endpoint check ---")
+    log.info("   URL     : %s", cfg["api_url"])
+    log.info("   Timeout : %ss", cfg["api_timeout"])
+    log.info("   (skipping actual upload — dry run)")
+
+    # --- Summary ---
+    if errors:
+        log.info("🧪 Test completed with %d error(s)", errors)
+        return 1
+    log.info("🧪 Test completed successfully — all checks passed")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Caisse watcher + API upload + MQTT status")
     parser.add_argument(
-        "day_offset",
-        nargs="?",
+        "--date-cursor",
         type=int,
         default=0,
         help="Day offset: 0=today, -1=yesterday, etc.",
     )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Test mode: check MQTT connectivity and dry-run the process without uploading.",
+    )
     args = parser.parse_args()
-    day_offset = args.day_offset
+    day_offset = args.date_cursor
 
     global CONFIG
     CONFIG = get_config(load_config())
     log = setup_logging(CONFIG)
+
+    if args.test:
+        return run_test_mode(log, CONFIG, day_offset)
+
     target_date, mmddyy, year_dir = target_date_and_paths(day_offset, CONFIG)
 
     log.info("▶️ Watcher started")
