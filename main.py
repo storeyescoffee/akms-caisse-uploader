@@ -12,6 +12,7 @@ import os
 import platform
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -61,11 +62,9 @@ def get_config(cfg: configparser.ConfigParser) -> dict:
     """Parse config into a flat dict with expanded paths."""
     return {
         "base_dir": _expand(cfg.get("local", "base_dir", fallback="~/shared/POINTEX21/CAFEDEROME")),
-        "store_id": cfg.get("local", "store_id", fallback="2"),
-        "log_file": _resolve(cfg.get("local", "log_file", fallback="./db_mb_watcher.log")),
+        "log_dir": _resolve(cfg.get("local", "log_dir", fallback="./logs")),
         "status_file": _resolve(cfg.get("local", "status_file", fallback="caisse_status.txt")),
         "api_url": cfg.get("api", "url", fallback="http://app.storeyes.io:8000/process"),
-        "delta_hour": cfg.get("api", "delta_hour", fallback="2"),
         "api_timeout": cfg.getint("api", "timeout", fallback=120),
         "sleep_interval": cfg.getint("watcher", "sleep_interval", fallback=10),
         "stable_seconds": cfg.getint("watcher", "stable_seconds", fallback=2),
@@ -73,7 +72,6 @@ def get_config(cfg: configparser.ConfigParser) -> dict:
         "mqtt_port": cfg.getint("mqtt", "port", fallback=1883),
         "mqtt_user": cfg.get("mqtt", "user", fallback="storeyes"),
         "mqtt_pass": cfg.get("mqtt", "password", fallback="12345"),
-        "mqtt_topic": cfg.get("mqtt", "topic", fallback=""),
         "mqtt_qos": cfg.getint("mqtt", "qos", fallback=1),
         "mqtt_retain": cfg.getboolean("mqtt", "retain", fallback=False),
         "mqtt_timeout": cfg.getint("mqtt", "timeout", fallback=5),
@@ -127,7 +125,7 @@ def publish_status_to_mqtt(status: int, cfg: dict | None = None) -> bool:
 
     c = cfg or CONFIG
     board_id = get_board_id()
-    topic = c["mqtt_topic"] or f"storeyes/{board_id}/caisse"
+    topic = f"storeyes/{board_id}/caisse"
     payload = {
         "board_id": board_id,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -195,7 +193,7 @@ def run_test_mode(log: logging.Logger, cfg: dict, day_offset: int) -> int:
         errors += 1
     else:
         board_id = get_board_id()
-        topic = cfg["mqtt_topic"] or f"storeyes/{board_id}/caisse"
+        topic = f"storeyes/{board_id}/caisse"
         log.info("   Board ID : %s", board_id)
         log.info("   Broker   : %s:%s", cfg["mqtt_host"], cfg["mqtt_port"])
         log.info("   Topic    : %s", topic)
@@ -239,14 +237,29 @@ def run_test_mode(log: logging.Logger, cfg: dict, day_offset: int) -> int:
         if db_file and mb_file:
             if is_stable(db_file, cfg) and is_stable(mb_file, cfg):
                 log.info("✅ Both files are stable")
+                # --- Upload with dry_run ---
+                log.info("--- API upload (dry_run: true) ---")
+                log.info("   URL     : %s", cfg["api_url"])
+                log.info("   Timeout : %ss", cfg["api_timeout"])
+                try:
+                    with open(db_file, "rb") as dbf, open(mb_file, "rb") as mbf:
+                        r = requests.post(
+                            cfg["api_url"],
+                            headers={"X-DEVICE-ID": get_board_id()},
+                            files={
+                                "file": (db_file.name, dbf, "application/octet-stream"),
+                                "mb_file": (mb_file.name, mbf, "application/octet-stream"),
+                            },
+                            data={"dry_run": "true"},
+                            timeout=cfg["api_timeout"],
+                        )
+                        r.raise_for_status()
+                    log.info("✅ Upload successful (dry run)")
+                except requests.RequestException as e:
+                    log.error("❌ Upload failed: %s", e)
+                    errors += 1
             else:
                 log.warning("⚠️  Files exist but are still changing")
-
-    # --- API endpoint check ---
-    log.info("--- API endpoint check ---")
-    log.info("   URL     : %s", cfg["api_url"])
-    log.info("   Timeout : %ss", cfg["api_timeout"])
-    log.info("   (skipping actual upload — dry run)")
 
     # --- Summary ---
     if errors:
@@ -267,13 +280,16 @@ def main() -> int:
     parser.add_argument(
         "--test",
         action="store_true",
-        help="Test mode: check MQTT connectivity and dry-run the process without uploading.",
+        help="Test mode: check connectivity and upload with dry_run: true.",
     )
     args = parser.parse_args()
     day_offset = args.date_cursor
 
     global CONFIG
     CONFIG = get_config(load_config())
+    log_dir = Path(CONFIG["log_dir"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    CONFIG["log_file"] = str(log_dir / f"{datetime.now():%Y-%m-%d-%H}.log")
     log = setup_logging(CONFIG)
 
     if args.test:
@@ -335,11 +351,11 @@ def main() -> int:
                     with open(db_file, "rb") as dbf, open(mb_file, "rb") as mbf:
                         r = requests.post(
                             CONFIG["api_url"],
+                            headers={"X-DEVICE-ID": get_board_id()},
                             files={
                                 "file": (db_file.name, dbf, "application/octet-stream"),
                                 "mb_file": (mb_file.name, mbf, "application/octet-stream"),
                             },
-                            data={"delta_hour": CONFIG["delta_hour"], "store_id": CONFIG["store_id"]},
                             timeout=CONFIG["api_timeout"],
                         )
                         r.raise_for_status()
