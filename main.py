@@ -289,7 +289,8 @@ def main() -> int:
     CONFIG = get_config(load_config())
     log_dir = Path(CONFIG["log_dir"])
     log_dir.mkdir(parents=True, exist_ok=True)
-    CONFIG["log_file"] = str(log_dir / f"{datetime.now():%Y-%m-%d-%H}.log")
+    # One log file per day; set once at startup so it stays the same after midnight
+    CONFIG["log_file"] = str(log_dir / f"{datetime.now():%Y-%m-%d}.log")
     log = setup_logging(CONFIG)
 
     if args.test:
@@ -340,15 +341,29 @@ def main() -> int:
     mb_file = next(year_dir.glob(mb_pattern), None)
 
     while True:
-        db_file = next(year_dir.glob(db_pattern), None)
-        mb_file = next(year_dir.glob(mb_pattern), None)
+        run_mount()
+        try:
+            db_file = next(year_dir.glob(db_pattern), None)
+            mb_file = next(year_dir.glob(mb_pattern), None)
+        except OSError as e:
+            log.error("❌ Cannot access year directory %s: %s", year_dir, e)
+            time.sleep(CONFIG["sleep_interval"])
+            continue
 
         if db_file and mb_file:
             log.info("📄 Found matching files")
             log.info("   DB: %s", db_file)
             log.info("   MB: %s", mb_file)
 
-            if is_stable(db_file, CONFIG) and is_stable(mb_file, CONFIG):
+            try:
+                stable_db = is_stable(db_file, CONFIG)
+                stable_mb = is_stable(mb_file, CONFIG)
+            except OSError as e:
+                log.error("❌ Cannot access files (mount down?): %s", e)
+                time.sleep(CONFIG["sleep_interval"])
+                continue
+
+            if stable_db and stable_mb:
                 log.info("✅ Files are stable, sending API request")
                 is_fallback = day_offset != 0
 
@@ -364,6 +379,10 @@ def main() -> int:
                             timeout=CONFIG["api_timeout"],
                         )
                         r.raise_for_status()
+                except OSError as e:
+                    log.error("❌ Cannot read files (mount down?): %s", e)
+                    time.sleep(CONFIG["sleep_interval"])
+                    continue
                 except requests.RequestException as e:
                     set_status(STATUS_FAILED, "API call failed", log, CONFIG)
                     log.error("❌ API call failed: %s", e)
