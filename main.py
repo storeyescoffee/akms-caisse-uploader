@@ -319,9 +319,14 @@ def main() -> int:
 
     run_mount()
 
-    if not year_dir.is_dir():
-        log.error("❌ Year directory not found: %s", year_dir)
-        set_status(STATUS_FAILED, "Year directory not found", log, CONFIG)
+    try:
+        if not year_dir.is_dir():
+            log.error("❌ Year directory not found: %s", year_dir)
+            set_status(STATUS_FAILED, "Year directory not found", log, CONFIG)
+            return 1
+    except OSError as e:
+        log.error("❌ Cannot access year directory %s: %s", year_dir, e)
+        set_status(STATUS_FAILED, f"Year directory unavailable: {e}", log, CONFIG)
         return 1
 
     # Clear log and set pending
