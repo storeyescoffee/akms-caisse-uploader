@@ -205,7 +205,7 @@ def run_reconcile_mode(log: logging.Logger, cfg: dict) -> int:
     headers = build_device_headers(cfg)
     base_url = cfg["device_gw_base_url"].rstrip("/")
     empty_days_url = f"{base_url}/device-gw/kpi/empty-days-last-30"
-    upsert_url = f"{base_url}/device-gw/kpi/upsert"
+    upsert_url = cfg["api_url"]
 
     run_mount()
     try:
