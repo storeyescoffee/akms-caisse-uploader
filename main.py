@@ -65,6 +65,8 @@ def get_config(cfg: configparser.ConfigParser) -> dict:
         "log_dir": _resolve(cfg.get("local", "log_dir", fallback="./logs")),
         "status_file": _resolve(cfg.get("local", "status_file", fallback="caisse_status.txt")),
         "api_url": cfg.get("api", "url", fallback="http://app.storeyes.io:8000/process"),
+        "device_gw_base_url": cfg.get("api", "device_gw_base_url", fallback="https://panel.storeyes.io/api"),
+        "api_key": cfg.get("api", "api_key", fallback="").strip(),
         "api_timeout": cfg.getint("api", "timeout", fallback=120),
         "sleep_interval": cfg.getint("watcher", "sleep_interval", fallback=10),
         "stable_seconds": cfg.getint("watcher", "stable_seconds", fallback=2),
@@ -118,6 +120,14 @@ def set_status(status: int, message: str = "", log: logging.Logger | None = None
     publish_status_to_mqtt(status, c)
 
 
+def make_mqtt_client():
+    """Create MQTT client with callback API v2 when available."""
+    try:
+        return mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    except (AttributeError, TypeError):
+        return mqtt.Client()
+
+
 def publish_status_to_mqtt(status: int, cfg: dict | None = None) -> bool:
     """Publish caisse status to MQTT broker (from caisse_monitor.sh)."""
     if not HAS_MQTT:
@@ -134,7 +144,7 @@ def publish_status_to_mqtt(status: int, cfg: dict | None = None) -> bool:
 
     for attempt in range(1, c["mqtt_retries"] + 1):
         try:
-            client = mqtt.Client()
+            client = make_mqtt_client()
             client.username_pw_set(c["mqtt_user"], c["mqtt_pass"])
             client.connect(c["mqtt_host"], c["mqtt_port"], c["mqtt_timeout"])
             msg = json.dumps(payload)
@@ -181,6 +191,115 @@ def run_mount() -> None:
         pass
 
 
+def build_device_headers(cfg: dict) -> dict[str, str]:
+    """Build device-gateway headers."""
+    headers = {"X-DEVICE-ID": get_board_id()}
+    if cfg.get("api_key"):
+        headers["X-API-KEY"] = cfg["api_key"]
+    return headers
+
+
+def run_reconcile_mode(log: logging.Logger, cfg: dict) -> int:
+    """Fetch empty KPI days and upload matching DB/MB files."""
+    log.info("🔄 Running in RECONCILE mode")
+    headers = build_device_headers(cfg)
+    base_url = cfg["device_gw_base_url"].rstrip("/")
+    empty_days_url = f"{base_url}/device-gw/kpi/empty-days-last-30"
+    upsert_url = f"{base_url}/device-gw/kpi/upsert"
+
+    run_mount()
+    try:
+        resp = requests.get(empty_days_url, headers=headers, timeout=cfg["api_timeout"])
+        resp.raise_for_status()
+        missing_days = resp.json()
+    except requests.RequestException as e:
+        log.error("❌ Failed to fetch empty KPI days: %s", e)
+        set_status(STATUS_FAILED, "Reconcile failed: cannot fetch empty days", log, cfg)
+        return 1
+    except ValueError as e:
+        log.error("❌ Invalid empty-days response JSON: %s", e)
+        set_status(STATUS_FAILED, "Reconcile failed: invalid empty-days response", log, cfg)
+        return 1
+
+    if not isinstance(missing_days, list):
+        log.error("❌ Empty-days response is not a JSON array")
+        set_status(STATUS_FAILED, "Reconcile failed: unexpected empty-days response", log, cfg)
+        return 1
+
+    if not missing_days:
+        log.info("✅ No missing KPI days in the last 30 days")
+        set_status(STATUS_SUCCESS, "Reconcile complete: nothing to upload", log, cfg)
+        return 0
+
+    uploaded = 0
+    skipped = 0
+    failed = 0
+
+    for date_str in missing_days:
+        try:
+            target = datetime.strptime(str(date_str), "%Y-%m-%d")
+        except ValueError:
+            log.warning("⚠️  Skipping invalid date from API: %s", date_str)
+            failed += 1
+            continue
+
+        mmddyy = target.strftime("%m%d%y")
+        year_dir = Path(cfg["base_dir"]) / f"AN{target.strftime('%Y')}"
+        db_file = year_dir / f"VD{mmddyy}.DB"
+        mb_file = year_dir / f"VD{mmddyy}.MB"
+        log.info("📅 Reconciling %s (MMDDYY=%s)", target.strftime("%Y-%m-%d"), mmddyy)
+
+        try:
+            year_exists = year_dir.is_dir()
+        except OSError as e:
+            log.error("❌ Cannot access year directory %s: %s", year_dir, e)
+            failed += 1
+            continue
+
+        if not year_exists:
+            log.warning("⚠️  Missing year directory: %s", year_dir)
+            skipped += 1
+            continue
+
+        if not db_file.is_file() or not mb_file.is_file():
+            log.warning("⚠️  Missing files for %s: DB=%s MB=%s", date_str, db_file.is_file(), mb_file.is_file())
+            skipped += 1
+            continue
+
+        if not is_stable(db_file, cfg) or not is_stable(mb_file, cfg):
+            log.warning("⚠️  Files still changing for %s, skipped", date_str)
+            skipped += 1
+            continue
+
+        try:
+            with open(db_file, "rb") as dbf, open(mb_file, "rb") as mbf:
+                upload_resp = requests.post(
+                    upsert_url,
+                    headers=headers,
+                    files={
+                        "file": (db_file.name, dbf, "application/octet-stream"),
+                        "mb_file": (mb_file.name, mbf, "application/octet-stream"),
+                    },
+                    timeout=cfg["api_timeout"],
+                )
+                upload_resp.raise_for_status()
+            uploaded += 1
+            log.info("✅ Reconciled upload succeeded for %s", date_str)
+        except OSError as e:
+            log.error("❌ Cannot read files for %s: %s", date_str, e)
+            failed += 1
+        except requests.RequestException as e:
+            log.error("❌ Reconciled upload failed for %s: %s", date_str, e)
+            failed += 1
+
+    log.info("🔎 Reconcile summary: uploaded=%d skipped=%d failed=%d", uploaded, skipped, failed)
+    if failed > 0:
+        set_status(STATUS_FAILED, f"Reconcile finished with failures (uploaded={uploaded}, failed={failed})", log, cfg)
+        return 1
+    set_status(STATUS_SUCCESS, f"Reconcile complete (uploaded={uploaded}, skipped={skipped})", log, cfg)
+    return 0
+
+
 def run_test_mode(log: logging.Logger, cfg: dict, day_offset: int) -> int:
     """Test mode: check MQTT connectivity and dry-run the file detection process."""
     log.info("🧪 Running in TEST mode (dry run)")
@@ -198,7 +317,7 @@ def run_test_mode(log: logging.Logger, cfg: dict, day_offset: int) -> int:
         log.info("   Broker   : %s:%s", cfg["mqtt_host"], cfg["mqtt_port"])
         log.info("   Topic    : %s", topic)
         try:
-            client = mqtt.Client()
+            client = make_mqtt_client()
             client.username_pw_set(cfg["mqtt_user"], cfg["mqtt_pass"])
             client.connect(cfg["mqtt_host"], cfg["mqtt_port"], cfg["mqtt_timeout"])
             client.disconnect()
@@ -282,6 +401,11 @@ def main() -> int:
         action="store_true",
         help="Test mode: check connectivity and upload with dry_run: true.",
     )
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Fetch missing KPI days (last 30) and upload matching DB/MB files.",
+    )
     args = parser.parse_args()
     day_offset = args.date_cursor
 
@@ -295,6 +419,8 @@ def main() -> int:
 
     if args.test:
         return run_test_mode(log, CONFIG, day_offset)
+    if args.reconcile:
+        return run_reconcile_mode(log, CONFIG)
 
     target_date, mmddyy, year_dir = target_date_and_paths(day_offset, CONFIG)
 
